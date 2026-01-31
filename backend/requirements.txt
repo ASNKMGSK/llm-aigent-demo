@@ -1,0 +1,33 @@
+fastapi>=0.110
+uvicorn>=0.24
+pydantic>=2.0
+pandas>=2.0
+numpy>=1.24
+joblib>=1.3
+openai>=1.0
+python-multipart>=0.0.6
+openpyxl>=3.1
+
+# Optional (RAG)
+langchain>=0.2
+langchain-openai>=0.1
+langchain-community>=0.2
+langchain-text-splitters>=0.2
+pypdf>=4.0
+PyPDF2>=3.0
+
+# Optional (SAR)
+recommenders>=1.2.0
+
+# MLOps
+mlflow>=2.10
+
+# OCR
+easyocr>=1.7
+
+# Advanced RAG (Hybrid Search + Reranking)
+rank-bm25>=0.2.2          # BM25 키워드 검색
+sentence-transformers>=2.2 # Cross-Encoder Reranking
+
+# GraphRAG (LLM 기반 지식 그래프)
+networkx>=3.0             # 그래프 라이브러리

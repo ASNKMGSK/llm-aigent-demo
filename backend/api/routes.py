@@ -1,0 +1,1210 @@
+"""
+api/routes.py - FastAPI 라우트 정의
+APIRouter를 사용하여 모든 엔드포인트를 정의합니다.
+"""
+import os
+import json
+from datetime import datetime
+from typing import Optional, List
+from io import StringIO, BytesIO
+
+import numpy as np
+import pandas as pd
+import joblib
+
+from fastapi import APIRouter, HTTPException, Depends, status, Request, UploadFile, File, BackgroundTasks
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+try:
+    import easyocr
+    OCR_AVAILABLE = True
+    OCR_READER = None  # Lazy loading
+except ImportError:
+    OCR_AVAILABLE = False
+    OCR_READER = None
+
+from core.constants import DEFAULT_SYSTEM_PROMPT, ML_MODEL_INFO
+from core.utils import safe_str, safe_int, json_sanitize
+from core.memory import clear_memory, append_memory
+from core.parsers import extract_merchant_id, extract_top_k_from_text
+from agent.tools import (
+    tool_get_merchant_metrics, tool_get_merchant_metrics_history_summary,
+    tool_predict_revenue, tool_detect_anomaly, tool_classify_growth,
+    tool_compare_industry, tool_explain_revenue_prediction,
+    tool_explain_growth_classification, tool_explain_anomaly_detection,
+    build_list_merchants_report, build_fallback_report_from_results,
+)
+from agent.intent import (
+    can_reuse_last_context, run_deterministic_tools, set_last_context,
+)
+from agent.llm import (
+    build_langchain_messages, get_llm, chunk_text, pick_api_key,
+)
+from agent.runner import run_agent
+from rag.service import (
+    rag_build_or_load_index, tool_rag_search, _rag_list_files,
+    rag_search_hybrid, BM25_AVAILABLE, RERANKER_AVAILABLE, KNOWLEDGE_GRAPH
+)
+from rag.graph_rag import (
+    build_graph_from_chunks, search_graph_rag, get_graph_rag_status,
+    clear_graph_rag, NETWORKX_AVAILABLE, GRAPH_RAG_STORE
+)
+import state as st
+
+router = APIRouter(prefix="/api")
+security = HTTPBasic()
+
+
+# ============================================================
+# Pydantic 모델
+# ============================================================
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class MerchantRequest(BaseModel):
+    merchant_id: str
+
+class IndustryRequest(BaseModel):
+    industry: str
+
+class RagRequest(BaseModel):
+    query: str
+    api_key: str = Field("", alias="apiKey")
+    top_k: int = Field(st.RAG_DEFAULT_TOPK, alias="topK")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+class AgentRequest(BaseModel):
+    user_input: str = Field(..., alias="user_input")
+    api_key: str = Field("", alias="apiKey")
+    model: str = Field("gpt-4o", alias="model")
+    max_tokens: int = Field(5000, alias="maxTokens")
+    system_prompt: str = Field(DEFAULT_SYSTEM_PROMPT, alias="systemPrompt")
+    temperature: Optional[float] = Field(None, alias="temperature")
+    top_p: Optional[float] = Field(None, alias="topP")
+    presence_penalty: Optional[float] = Field(None, alias="presencePenalty")
+    frequency_penalty: Optional[float] = Field(None, alias="frequencyPenalty")
+    seed: Optional[int] = Field(None, alias="seed")
+    timeout_ms: Optional[int] = Field(None, alias="timeoutMs")
+    retries: Optional[int] = Field(None, alias="retries")
+    stream: Optional[bool] = Field(None, alias="stream")
+    debug: bool = Field(True, alias="debug")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+class UserCreateRequest(BaseModel):
+    user_id: str
+    name: str
+    password: str
+    role: str
+
+class RagReloadRequest(BaseModel):
+    api_key: str = Field("", alias="apiKey")
+    force: bool = Field(True, alias="force")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+class DeleteFileRequest(BaseModel):
+    filename: str
+    api_key: str = Field("", alias="apiKey")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+
+class HybridSearchRequest(BaseModel):
+    """Hybrid Search 요청 모델"""
+    query: str
+    api_key: str = Field("", alias="apiKey")
+    top_k: int = Field(5, alias="topK")
+    use_reranking: bool = Field(True, alias="useReranking")
+    use_kg: bool = Field(False, alias="useKg")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+
+class GraphRagBuildRequest(BaseModel):
+    """GraphRAG 빌드 요청 모델"""
+    api_key: str = Field("", alias="apiKey")
+    max_chunks: int = Field(20, alias="maxChunks")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+
+class GraphRagSearchRequest(BaseModel):
+    """GraphRAG 검색 요청 모델"""
+    query: str
+    api_key: str = Field("", alias="apiKey")
+    top_k: int = Field(5, alias="topK")
+    include_neighbors: bool = Field(True, alias="includeNeighbors")
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
+
+
+# ============================================================
+# 인증
+# ============================================================
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    username = credentials.username
+    password = credentials.password
+    if username not in st.USERS or st.USERS[username]["password"] != password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="인증 실패",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return {"username": username, "role": st.USERS[username]["role"], "name": st.USERS[username]["name"]}
+
+
+# ============================================================
+# 유틸
+# ============================================================
+def sse_pack(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# ============================================================
+# 헬스 체크
+# ============================================================
+@router.get("/health")
+def health():
+    st.logger.info("HEALTH_CHECK")
+    return {
+        "status": "SUCCESS",
+        "message": "ok",
+        "log_file": st.LOG_FILE,
+        "pid": os.getpid(),
+        "models_ready": bool(st.rf_reg is not None and st.iso_forest is not None and st.rf_clf is not None and st.scaler is not None),
+        "reco_ready": bool(st.sar_model is not None),
+        "metrics_rows": int(len(st.metrics_clean)) if st.metrics_clean is not None else 0,
+        "merchants_rows": int(len(st.merchants)) if st.merchants is not None else 0,
+    }
+
+
+# ============================================================
+# 로그인
+# ============================================================
+@router.post("/login")
+def login(credentials: HTTPBasicCredentials = Depends(security)):
+    username = credentials.username
+    password = credentials.password
+    if username not in st.USERS or st.USERS[username]["password"] != password:
+        raise HTTPException(status_code=401, detail="인증 실패")
+    user = st.USERS[username]
+    clear_memory(username)
+    return {"status": "SUCCESS", "username": username, "user_name": user["name"], "user_role": user["role"]}
+
+
+# ============================================================
+# 가맹점
+# ============================================================
+@router.get("/merchants")
+def get_merchants(user: dict = Depends(verify_credentials)):
+    return {"status": "SUCCESS", "data": st.merchants.to_dict("records") if st.merchants is not None else []}
+
+
+@router.get("/merchants/{merchant_id}")
+def get_merchant(merchant_id: str, user: dict = Depends(verify_credentials)):
+    return tool_get_merchant_metrics(merchant_id)
+
+
+@router.get("/merchants/{merchant_id}/metrics")
+def get_merchant_metrics_history(merchant_id: str, user: dict = Depends(verify_credentials)):
+    key = safe_str(merchant_id).strip()
+    data = st.METRICS_BY_MERCHANT.get(key)
+    if data is None:
+        raise HTTPException(status_code=404, detail="가맹점 없음")
+
+    result_data = data.copy()
+    cols_to_convert = ["txn_month", "industry", "region", "growth_type", "merchant_name", "merchant_id"]
+    for col in cols_to_convert:
+        if col in result_data.columns:
+            result_data[col] = result_data[col].astype(str)
+
+    records = result_data.to_dict("records")
+    return json_sanitize({"status": "SUCCESS", "data": records})
+
+
+# ============================================================
+# ML 예측/분류/탐지
+# ============================================================
+@router.post("/predict/revenue")
+def predict_revenue(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_predict_revenue(req.merchant_id, top_k=5, include_explain=True)
+
+
+@router.post("/detect/anomaly")
+def detect_anomaly(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_detect_anomaly(req.merchant_id, top_k=5, include_explain=True)
+
+
+@router.post("/classify/growth")
+def classify_growth(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_classify_growth(req.merchant_id, top_k=5, include_explain=True)
+
+
+@router.post("/industry/compare")
+def compare_industry(req: IndustryRequest, user: dict = Depends(verify_credentials)):
+    return tool_compare_industry(req.industry)
+
+
+@router.get("/industries")
+def get_industries(user: dict = Depends(verify_credentials)):
+    if st.metrics_clean is None or len(st.metrics_clean) == 0 or "industry" not in st.metrics_clean.columns:
+        return {"status": "SUCCESS", "data": []}
+    return {"status": "SUCCESS", "data": st.metrics_clean["industry"].astype(str).unique().tolist()}
+
+
+# ============================================================
+# RAG
+# ============================================================
+@router.post("/rag/search")
+def search_rag(req: RagRequest, user: dict = Depends(verify_credentials)):
+    return tool_rag_search(req.query, top_k=req.top_k, api_key=req.api_key)
+
+
+@router.post("/rag/search/hybrid")
+def search_rag_hybrid(req: HybridSearchRequest, user: dict = Depends(verify_credentials)):
+    """
+    고급 RAG 검색 (Hybrid Search)
+    - BM25 (키워드) + Vector (의미) 조합
+    - Cross-Encoder Reranking (선택)
+    - Knowledge Graph 보강 (선택)
+    """
+    return rag_search_hybrid(
+        query=req.query,
+        top_k=req.top_k,
+        api_key=req.api_key,
+        use_reranking=req.use_reranking,
+        use_kg=req.use_kg
+    )
+
+
+@router.get("/rag/status")
+def rag_status(user: dict = Depends(verify_credentials)):
+    graph_status = get_graph_rag_status()
+    with st.RAG_LOCK:
+        return {
+            "status": "SUCCESS",
+            "rag_ready": bool(st.RAG_STORE.get("ready")),
+            "docs_dir": st.RAG_DOCS_DIR,
+            "faiss_dir": st.RAG_FAISS_DIR,
+            "embed_model": st.RAG_EMBED_MODEL,
+            "files_count": int(st.RAG_STORE.get("files_count") or st.RAG_STORE.get("docs_count") or 0),
+            "chunks_count": int(st.RAG_STORE.get("chunks_count") or st.RAG_STORE.get("docs_count") or 0),
+            "hash": safe_str(st.RAG_STORE.get("hash", "")),
+            "last_build_ts": float(st.RAG_STORE.get("last_build_ts") or 0.0),
+            "error": safe_str(st.RAG_STORE.get("error", "")),
+            # Advanced RAG Features
+            "bm25_available": BM25_AVAILABLE,
+            "bm25_ready": bool(st.RAG_STORE.get("bm25_ready")),
+            "reranker_available": RERANKER_AVAILABLE,
+            "kg_ready": bool(st.RAG_STORE.get("kg_ready")),
+            "kg_entities_count": len(KNOWLEDGE_GRAPH.get("entities", {})) if KNOWLEDGE_GRAPH else 0,
+            "kg_relations_count": len(KNOWLEDGE_GRAPH.get("relations", [])) if KNOWLEDGE_GRAPH else 0,
+            # GraphRAG (LLM 기반)
+            "graphrag_available": NETWORKX_AVAILABLE,
+            "graphrag_ready": graph_status.get("ready", False),
+            "graphrag_entities": graph_status.get("entity_count", 0),
+            "graphrag_relations": graph_status.get("relation_count", 0),
+            "graphrag_communities": graph_status.get("community_count", 0),
+        }
+
+
+@router.post("/rag/reload")
+def rag_reload(req: RagReloadRequest, user: dict = Depends(verify_credentials)):
+    if user.get("role") != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    try:
+        k = safe_str(req.api_key).strip() or st.OPENAI_API_KEY
+        if not k:
+            return {"status": "FAILED", "error": "OpenAI API Key가 설정되지 않았습니다."}
+
+        rag_build_or_load_index(api_key=k, force_rebuild=bool(req.force))
+
+        with st.RAG_LOCK:
+            ok = bool(st.RAG_STORE.get("ready"))
+            err = safe_str(st.RAG_STORE.get("error", ""))
+            return {
+                "status": "SUCCESS" if ok else "FAILED",
+                "rag_ready": ok,
+                "files_count": int(st.RAG_STORE.get("files_count") or st.RAG_STORE.get("docs_count") or 0),
+                "chunks_count": int(st.RAG_STORE.get("chunks_count") or st.RAG_STORE.get("docs_count") or 0),
+                "hash": safe_str(st.RAG_STORE.get("hash", "")),
+                "error": err if err else ("인덱스 빌드 실패" if not ok else ""),
+                "embed_model": st.RAG_EMBED_MODEL,
+            }
+    except Exception as e:
+        st.logger.exception("RAG 재빌드 실패")
+        return {"status": "FAILED", "error": f"RAG 재빌드 실패: {safe_str(e)}"}
+
+
+@router.post("/rag/upload")
+async def upload_rag_document(
+    file: UploadFile = File(...),
+    api_key: str = "",
+    background_tasks: BackgroundTasks = None,
+    user: dict = Depends(verify_credentials),
+):
+    try:
+        filename = file.filename or "unknown"
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext not in st.RAG_ALLOWED_EXTS:
+            return {"status": "FAILED", "error": f"지원하지 않는 파일 형식입니다. 허용된 형식: {', '.join(st.RAG_ALLOWED_EXTS)}"}
+
+        MAX_FILE_SIZE = 10 * 1024 * 1024
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            return {"status": "FAILED", "error": "파일 크기는 10MB를 초과할 수 없습니다."}
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = f"{timestamp}_{filename}"
+        file_path = os.path.join(st.RAG_DOCS_DIR, safe_filename)
+
+        os.makedirs(st.RAG_DOCS_DIR, exist_ok=True)
+
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        # 백그라운드에서 인덱스 재빌드 (즉시 응답 반환)
+        k = (api_key or "").strip() or st.OPENAI_API_KEY
+        if k and background_tasks:
+            background_tasks.add_task(rag_build_or_load_index, api_key=k, force_rebuild=True)
+
+        return {
+            "status": "SUCCESS",
+            "message": "파일이 업로드되었습니다. 인덱스 재빌드 중...",
+            "filename": safe_filename,
+            "original_filename": filename,
+            "size": len(contents),
+            "path": os.path.relpath(file_path, st.BASE_DIR),
+        }
+    except Exception as e:
+        st.logger.exception("파일 업로드 실패")
+        return {"status": "FAILED", "error": f"파일 업로드 실패: {safe_str(e)}"}
+
+
+@router.get("/rag/files")
+def list_rag_files(user: dict = Depends(verify_credentials)):
+    try:
+        files_info = []
+        paths = _rag_list_files()
+
+        for p in paths:
+            try:
+                stat = os.stat(p)
+                rel_path = os.path.relpath(p, st.RAG_DOCS_DIR).replace("\\", "/")
+                files_info.append({
+                    "filename": os.path.basename(p),
+                    "path": rel_path,
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "ext": os.path.splitext(p)[1].lower(),
+                })
+            except Exception:
+                continue
+
+        return {"status": "SUCCESS", "files": files_info, "total": len(files_info)}
+    except Exception as e:
+        st.logger.exception("파일 목록 조회 실패")
+        return {"status": "FAILED", "error": f"파일 목록 조회 실패: {safe_str(e)}"}
+
+
+@router.post("/rag/delete")
+def delete_rag_file(
+    req: DeleteFileRequest,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(verify_credentials)
+):
+    if user.get("role") != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    try:
+        filename = os.path.basename(req.filename)
+        file_path = os.path.join(st.RAG_DOCS_DIR, filename)
+
+        if not file_path.startswith(os.path.abspath(st.RAG_DOCS_DIR)):
+            return {"status": "FAILED", "error": "잘못된 파일 경로입니다."}
+
+        if not os.path.exists(file_path):
+            return {"status": "FAILED", "error": "파일을 찾을 수 없습니다."}
+
+        os.remove(file_path)
+
+        # 백그라운드에서 인덱스 재빌드 (즉시 응답 반환)
+        k = safe_str(req.api_key).strip() or st.OPENAI_API_KEY
+        if k:
+            background_tasks.add_task(rag_build_or_load_index, api_key=k, force_rebuild=True)
+
+        return {"status": "SUCCESS", "message": "파일이 삭제되었습니다. 인덱스 재빌드 중...", "filename": filename}
+    except Exception as e:
+        st.logger.exception("파일 삭제 실패")
+        return {"status": "FAILED", "error": f"파일 삭제 실패: {safe_str(e)}"}
+
+
+# ============================================================
+# GraphRAG (LLM 기반 지식 그래프)
+# ============================================================
+@router.get("/graphrag/status")
+def graphrag_status(user: dict = Depends(verify_credentials)):
+    """GraphRAG 상태 조회"""
+    status = get_graph_rag_status()
+    return {"status": "SUCCESS", **status}
+
+
+@router.post("/graphrag/build")
+def graphrag_build(
+    req: GraphRagBuildRequest,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(verify_credentials)
+):
+    """GraphRAG 지식 그래프 빌드 (LLM 기반 엔티티/관계 추출)"""
+    if user.get("role") != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    try:
+        k = safe_str(req.api_key).strip() or st.OPENAI_API_KEY
+        if not k:
+            return {"status": "FAILED", "error": "OpenAI API Key가 필요합니다."}
+
+        if not NETWORKX_AVAILABLE:
+            return {"status": "FAILED", "error": "NetworkX가 설치되지 않았습니다. pip install networkx"}
+
+        # RAG 청크 가져오기
+        with st.RAG_LOCK:
+            idx = st.RAG_STORE.get("index")
+
+        if idx is None:
+            return {"status": "FAILED", "error": "RAG 인덱스가 없습니다. 먼저 문서를 업로드하세요."}
+
+        # 청크 추출
+        try:
+            docstore = idx.docstore
+            chunks = list(docstore._dict.values())
+        except Exception:
+            return {"status": "FAILED", "error": "RAG 인덱스에서 청크를 가져올 수 없습니다."}
+
+        if not chunks:
+            return {"status": "FAILED", "error": "RAG에 문서가 없습니다."}
+
+        # 백그라운드에서 GraphRAG 빌드
+        background_tasks.add_task(build_graph_from_chunks, chunks, k, req.max_chunks)
+
+        return {
+            "status": "SUCCESS",
+            "message": f"GraphRAG 빌드 시작 (최대 {req.max_chunks}개 청크 처리)",
+            "chunks_available": len(chunks),
+        }
+
+    except Exception as e:
+        st.logger.exception("GraphRAG 빌드 실패")
+        return {"status": "FAILED", "error": f"GraphRAG 빌드 실패: {safe_str(e)}"}
+
+
+@router.post("/graphrag/search")
+def graphrag_search(req: GraphRagSearchRequest, user: dict = Depends(verify_credentials)):
+    """GraphRAG 검색 - 지식 그래프 기반 검색"""
+    try:
+        k = safe_str(req.api_key).strip() or st.OPENAI_API_KEY
+        result = search_graph_rag(
+            query=req.query,
+            api_key=k,
+            top_k=req.top_k,
+            include_neighbors=req.include_neighbors
+        )
+        return result
+    except Exception as e:
+        st.logger.exception("GraphRAG 검색 실패")
+        return {"status": "FAILED", "error": f"GraphRAG 검색 실패: {safe_str(e)}"}
+
+
+@router.post("/graphrag/clear")
+def graphrag_clear(user: dict = Depends(verify_credentials)):
+    """GraphRAG 초기화"""
+    if user.get("role") != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    clear_graph_rag()
+    return {"status": "SUCCESS", "message": "GraphRAG가 초기화되었습니다."}
+
+
+# ============================================================
+# OCR (이미지 → 텍스트 추출 → RAG 연동)
+# ============================================================
+OCR_ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+
+
+@router.post("/ocr/extract")
+async def ocr_extract(
+    file: UploadFile = File(...),
+    api_key: str = "",
+    save_to_rag: bool = True,
+    user: dict = Depends(verify_credentials),
+):
+    """이미지에서 텍스트 추출 (EasyOCR) + RAG 연동"""
+    global OCR_READER
+
+    if not OCR_AVAILABLE:
+        return {"status": "FAILED", "error": "OCR 라이브러리(easyocr)가 설치되지 않았습니다. pip install easyocr"}
+
+    try:
+        filename = file.filename or "unknown"
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext not in OCR_ALLOWED_EXTS:
+            return {"status": "FAILED", "error": f"지원하지 않는 이미지 형식입니다. 허용된 형식: {', '.join(OCR_ALLOWED_EXTS)}"}
+
+        MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            return {"status": "FAILED", "error": "파일 크기는 20MB를 초과할 수 없습니다."}
+
+        # EasyOCR Reader 초기화 (Lazy loading - 첫 호출시만)
+        if OCR_READER is None:
+            st.logger.info("OCR_INIT: EasyOCR Reader 초기화 중...")
+            OCR_READER = easyocr.Reader(['ko', 'en'], gpu=False)
+            st.logger.info("OCR_INIT: EasyOCR Reader 초기화 완료")
+
+        # OCR 수행
+        result_list = OCR_READER.readtext(contents)
+        extracted_text = "\n".join([text for _, text, _ in result_list])
+        extracted_text = extracted_text.strip()
+
+        if not extracted_text:
+            return {"status": "FAILED", "error": "이미지에서 텍스트를 추출할 수 없습니다."}
+
+        result = {
+            "status": "SUCCESS",
+            "original_filename": filename,
+            "extracted_text": extracted_text,
+            "text_length": len(extracted_text),
+        }
+
+        # RAG에 저장
+        if save_to_rag:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            txt_filename = f"{timestamp}_ocr_{os.path.splitext(filename)[0]}.txt"
+            txt_path = os.path.join(st.RAG_DOCS_DIR, txt_filename)
+
+            os.makedirs(st.RAG_DOCS_DIR, exist_ok=True)
+
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(f"[OCR 추출 문서]\n")
+                f.write(f"원본 파일: {filename}\n")
+                f.write(f"추출 일시: {datetime.now().isoformat()}\n")
+                f.write(f"{'='*50}\n\n")
+                f.write(extracted_text)
+
+            # RAG 인덱스 재빌드
+            k = (api_key or "").strip() or st.OPENAI_API_KEY
+            if k:
+                rag_build_or_load_index(api_key=k, force_rebuild=True)
+
+            result["saved_to_rag"] = True
+            result["rag_filename"] = txt_filename
+            result["message"] = "텍스트가 추출되어 RAG에 저장되었습니다."
+        else:
+            result["saved_to_rag"] = False
+            result["message"] = "텍스트가 추출되었습니다."
+
+        st.logger.info(f"OCR_EXTRACT file={filename} text_len={len(extracted_text)} saved_to_rag={save_to_rag}")
+        return result
+
+    except Exception as e:
+        st.logger.exception("OCR 추출 실패")
+        return {"status": "FAILED", "error": f"OCR 추출 실패: {safe_str(e)}"}
+
+
+@router.get("/ocr/status")
+def ocr_status(user: dict = Depends(verify_credentials)):
+    """OCR 기능 상태 확인"""
+    easyocr_version = None
+    reader_initialized = False
+
+    if OCR_AVAILABLE:
+        try:
+            easyocr_version = easyocr.__version__
+            reader_initialized = OCR_READER is not None
+        except Exception:
+            pass
+
+    return {
+        "status": "SUCCESS",
+        "ocr_available": OCR_AVAILABLE,
+        "library": "EasyOCR",
+        "version": easyocr_version,
+        "reader_initialized": reader_initialized,
+        "supported_formats": list(OCR_ALLOWED_EXTS),
+        "supported_languages": ["ko", "en"],
+    }
+
+
+# ============================================================
+# 에이전트 (동기/스트리밍)
+# ============================================================
+@router.post("/agent/chat")
+def agent_chat(req: AgentRequest, user: dict = Depends(verify_credentials)):
+    out = run_agent(req, username=user["username"])
+    if isinstance(out, dict) and "status" not in out:
+        out["status"] = "SUCCESS"
+    return out
+
+
+@router.post("/agent/memory/clear")
+def clear_agent_memory(user: dict = Depends(verify_credentials)):
+    clear_memory(user["username"])
+    return {"status": "SUCCESS", "message": "메모리 초기화 완료"}
+
+
+@router.post("/agent/stream")
+async def agent_stream(req: AgentRequest, request: Request, user: dict = Depends(verify_credentials)):
+    st.logger.info(
+        "STREAM_REQ headers_auth=%s origin=%s ua=%s",
+        request.headers.get("authorization"),
+        request.headers.get("origin"),
+        request.headers.get("user-agent"),
+    )
+    username = user["username"]
+
+    async def gen():
+        tool_results = {}
+        tool_calls = []
+        final_buf = []
+
+        try:
+            user_text = safe_str(req.user_input)
+            merchant_id = extract_merchant_id(user_text)
+
+            reuse_ok, ctx = can_reuse_last_context(username, merchant_id, user_text)
+            if reuse_ok and ctx:
+                tool_results = ctx.get("results") or {}
+                if not merchant_id:
+                    merchant_id = safe_str(ctx.get("merchant_id")).strip().upper() or None
+            else:
+                tool_results = run_deterministic_tools(user_text, merchant_id)
+
+            if (merchant_id is None) and isinstance(tool_results.get("list_merchants"), dict) and tool_results["list_merchants"].get("status") == "SUCCESS":
+                report = build_list_merchants_report(tool_results["list_merchants"])
+                set_last_context(username, merchant_id=None, results=tool_results, user_text=user_text, mode="deterministic_list_report_stream")
+
+                for ch in report:
+                    if await request.is_disconnected():
+                        return
+                    yield sse_pack("delta", {"delta": ch})
+
+                append_memory(username, user_text, report)
+                yield sse_pack("done", {
+                    "ok": True, "final": report,
+                    "tool_calls": [{"tool": k, "result": v} for k, v in tool_results.items()],
+                })
+                return
+
+            tool_calls = [{"tool": k, "result": v} for k, v in tool_results.items()]
+
+            api_key = pick_api_key(req.api_key)
+            if not api_key:
+                msg = "처리 오류: OpenAI API Key가 없습니다. 환경변수 OPENAI_API_KEY 또는 요청의 api_key를 설정하세요."
+                yield sse_pack("done", {"ok": False, "final": msg, "tool_calls": tool_calls})
+                return
+            try:
+                rag_out = tool_rag_search(user_text, top_k=st.RAG_DEFAULT_TOPK, api_key=api_key)
+                if isinstance(rag_out, dict) and rag_out.get("status") == "SUCCESS":
+                    results = rag_out.get("results") or []
+                    if results:
+                        tool_results["rag"] = rag_out
+                        st.logger.info("RAG_IN_AGENT ok=1 results=%d", len(results))
+                    else:
+                        st.logger.info("RAG_IN_AGENT ok=0 results=0")
+                else:
+                    st.logger.info("RAG_IN_AGENT fail status=%s", safe_str(rag_out.get("status") if isinstance(rag_out, dict) else ""))
+            except Exception as _e:
+                st.logger.warning("RAG_IN_AGENT_FAIL err=%s", safe_str(_e))
+
+            # RAG까지 포함된 tool_calls로 갱신 (디버그/프론트 표시용)
+            tool_calls = [{"tool": k, "result": v} for k, v in tool_results.items()]
+
+            messages = build_langchain_messages(req.system_prompt, username, user_text, tool_results)
+            llm = get_llm(
+                req.model, api_key, req.max_tokens or 1500, streaming=True,
+                temperature=req.temperature, top_p=req.top_p,
+                presence_penalty=req.presence_penalty, frequency_penalty=req.frequency_penalty,
+                seed=req.seed, timeout_ms=req.timeout_ms, max_retries=req.retries,
+            )
+
+            for chunk_obj in llm.stream(messages):
+                if await request.is_disconnected():
+                    return
+                delta = chunk_text(chunk_obj)
+                if delta:
+                    final_buf.append(delta)
+                    yield sse_pack("delta", {"delta": delta})
+
+            final_text = "".join(final_buf).strip()
+            if not final_text:
+                final_text = build_fallback_report_from_results(tool_results)
+
+            append_memory(username, user_text, final_text)
+            set_last_context(username, merchant_id=merchant_id, results=tool_results, user_text=user_text, mode="deterministic_langchain_stream")
+
+            yield sse_pack("done", {"ok": True, "final": final_text, "tool_calls": tool_calls})
+            return
+
+        except Exception as e:
+            msg = safe_str(e) or "스트리밍 오류"
+            try:
+                yield sse_pack("error", {"message": msg})
+            except Exception:
+                pass
+            yield sse_pack("done", {"ok": False, "final": msg, "tool_calls": tool_calls})
+            return
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+# ============================================================
+# 통계/내보내기/설정
+# ============================================================
+@router.get("/stats/summary")
+def get_summary_stats(user: dict = Depends(verify_credentials)):
+    total_rev = 0.0
+    avg_gr = 0.0
+
+    if st.metrics_clean is not None and len(st.metrics_clean):
+        total_rev = float(pd.to_numeric(st.metrics_clean.get("total_revenue", 0.0), errors="coerce").fillna(0.0).sum())
+        avg_gr = float(pd.to_numeric(st.metrics_clean.get("revenue_growth_rate", 0.0), errors="coerce").fillna(0.0).mean())
+        if not np.isfinite(total_rev):
+            total_rev = 0.0
+        if not np.isfinite(avg_gr):
+            avg_gr = 0.0
+        avg_gr = round(avg_gr, 2)
+
+    industry_stats = {}
+    if st.metrics_clean is not None and "industry" in st.metrics_clean.columns and "total_revenue" in st.metrics_clean.columns and len(st.metrics_clean):
+        s = pd.to_numeric(st.metrics_clean["total_revenue"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        tmp = st.metrics_clean.assign(_rev=s).groupby(st.metrics_clean["industry"].astype(str))["_rev"].mean()
+        industry_stats = {str(k): float(v) if np.isfinite(float(v)) else 0.0 for k, v in tmp.to_dict().items()}
+
+    region_stats = {}
+    if st.metrics_clean is not None and "region" in st.metrics_clean.columns and "total_revenue" in st.metrics_clean.columns and len(st.metrics_clean):
+        s = pd.to_numeric(st.metrics_clean["total_revenue"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        tmp = st.metrics_clean.assign(_rev=s).groupby(st.metrics_clean["region"].astype(str))["_rev"].mean()
+        region_stats = {str(k): float(v) if np.isfinite(float(v)) else 0.0 for k, v in tmp.to_dict().items()}
+
+    payload = {
+        "status": "SUCCESS",
+        "merchant_count": int(st.metrics_clean["merchant_id"].nunique()) if st.metrics_clean is not None and "merchant_id" in st.metrics_clean.columns else 0,
+        "data_count": int(len(st.metrics_clean)) if st.metrics_clean is not None else 0,
+        "total_revenue": total_rev,
+        "avg_growth_rate": avg_gr,
+        "industry_stats": industry_stats,
+        "region_stats": region_stats,
+    }
+    return json_sanitize(payload)
+
+
+@router.get("/ml/models")
+def get_ml_models(user: dict = Depends(verify_credentials)):
+    return {"status": "SUCCESS", "data": ML_MODEL_INFO}
+
+
+@router.get("/mlflow/experiments")
+def get_mlflow_experiments(user: dict = Depends(verify_credentials)):
+    """MLflow 실험 목록 조회"""
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        # 노트북에서 생성한 mlruns 폴더 경로 (project 루트)
+        project_mlruns = os.path.abspath(os.path.join(st.BASE_DIR, "..", "mlruns"))
+        backend_mlruns = os.path.join(st.BASE_DIR, "mlruns")
+
+        # 두 경로 중 존재하는 것 사용
+        if os.path.exists(project_mlruns):
+            tracking_uri = f"file:{project_mlruns}"
+        elif os.path.exists(backend_mlruns):
+            tracking_uri = f"file:{backend_mlruns}"
+        else:
+            tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
+
+        mlflow.set_tracking_uri(tracking_uri)
+        client = MlflowClient()
+
+        experiments = client.search_experiments()
+        result = []
+
+        for exp in experiments:
+            runs = client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                order_by=["start_time DESC"],
+                max_results=10
+            )
+
+            runs_data = []
+            for run in runs:
+                runs_data.append({
+                    "run_id": run.info.run_id,
+                    "run_name": run.info.run_name,
+                    "status": run.info.status,
+                    "start_time": run.info.start_time,
+                    "end_time": run.info.end_time,
+                    "params": dict(run.data.params),
+                    "metrics": {k: round(v, 4) for k, v in run.data.metrics.items()},
+                    "tags": dict(run.data.tags),
+                })
+
+            result.append({
+                "experiment_id": exp.experiment_id,
+                "name": exp.name,
+                "artifact_location": exp.artifact_location,
+                "lifecycle_stage": exp.lifecycle_stage,
+                "runs": runs_data,
+            })
+
+        return {"status": "SUCCESS", "data": result}
+    except ImportError:
+        return {"status": "FAILED", "error": "MLflow가 설치되지 않았습니다.", "data": []}
+    except Exception as e:
+        st.logger.exception("MLflow 조회 실패")
+        return {"status": "FAILED", "error": safe_str(e), "data": []}
+
+
+@router.get("/mlflow/models")
+def get_mlflow_registered_models(user: dict = Depends(verify_credentials)):
+    """MLflow Model Registry에서 등록된 모델 + 아티팩트 기반 모델 목록 조회"""
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        project_mlruns = os.path.abspath(os.path.join(st.BASE_DIR, "..", "mlruns"))
+        backend_mlruns = os.path.join(st.BASE_DIR, "mlruns")
+
+        if os.path.exists(project_mlruns):
+            tracking_uri = f"file:{project_mlruns}"
+        elif os.path.exists(backend_mlruns):
+            tracking_uri = f"file:{backend_mlruns}"
+        else:
+            tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
+
+        mlflow.set_tracking_uri(tracking_uri)
+        client = MlflowClient()
+
+        registered_models = client.search_registered_models()
+        result = []
+
+        # 1. Model Registry에 등록된 모델들 (모든 버전 조회)
+        for rm in registered_models:
+            versions = []
+            # 모든 버전 조회 (latest_versions 대신 search_model_versions 사용)
+            try:
+                all_versions = client.search_model_versions(filter_string=f"name='{rm.name}'")
+                for v in sorted(all_versions, key=lambda x: int(x.version), reverse=True):
+                    versions.append({
+                        "version": v.version,
+                        "stage": v.current_stage,
+                        "status": v.status,
+                        "run_id": v.run_id,
+                        "source": v.source,
+                        "creation_timestamp": v.creation_timestamp,
+                    })
+            except Exception:
+                # fallback: latest_versions 사용
+                for v in rm.latest_versions:
+                    versions.append({
+                        "version": v.version,
+                        "stage": v.current_stage,
+                        "status": v.status,
+                        "run_id": v.run_id,
+                        "source": v.source,
+                        "creation_timestamp": v.creation_timestamp,
+                    })
+
+            result.append({
+                "name": rm.name,
+                "creation_timestamp": rm.creation_timestamp,
+                "last_updated_timestamp": rm.last_updated_timestamp,
+                "description": rm.description or "",
+                "versions": versions,
+                "model_type": "registry",
+            })
+
+        # 2. 아티팩트 기반 모델 (recommendation_model) 찾기
+        try:
+            experiments = client.search_experiments()
+            for exp in experiments:
+                runs = client.search_runs(
+                    experiment_ids=[exp.experiment_id],
+                    filter_string="tags.model_type = 'recommendation'",
+                    order_by=["start_time DESC"],
+                    max_results=5
+                )
+                for run in runs:
+                    # 이미 추가된 추천 모델이 있는지 확인
+                    reco_exists = any(m["name"] == "fintech-recommendation-model" for m in result)
+                    if not reco_exists:
+                        result.append({
+                            "name": "fintech-recommendation-model",
+                            "creation_timestamp": run.info.start_time,
+                            "last_updated_timestamp": run.info.end_time or run.info.start_time,
+                            "description": "SAR 추천 모델 (아티팩트)",
+                            "versions": [{
+                                "version": "1",
+                                "stage": "None",
+                                "status": "READY",
+                                "run_id": run.info.run_id,
+                                "source": f"runs:/{run.info.run_id}/model/model_reco.pkl",
+                                "creation_timestamp": run.info.start_time,
+                            }],
+                            "model_type": "artifact",
+                        })
+                        break
+        except Exception as e:
+            st.logger.warning(f"아티팩트 모델 검색 실패: {e}")
+
+        return {"status": "SUCCESS", "data": result}
+    except ImportError:
+        return {"status": "FAILED", "error": "MLflow가 설치되지 않았습니다.", "data": []}
+    except Exception as e:
+        st.logger.exception("MLflow 모델 조회 실패")
+        return {"status": "FAILED", "error": safe_str(e), "data": []}
+
+
+class ModelSelectRequest(BaseModel):
+    model_name: str
+    version: str
+
+
+@router.post("/mlflow/models/select")
+def select_mlflow_model(req: ModelSelectRequest, user: dict = Depends(verify_credentials)):
+    """MLflow에서 특정 버전의 모델을 선택하여 로드"""
+    if user.get("role") != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        project_mlruns = os.path.abspath(os.path.join(st.BASE_DIR, "..", "mlruns"))
+        backend_mlruns = os.path.join(st.BASE_DIR, "mlruns")
+
+        if os.path.exists(project_mlruns):
+            mlruns_path = project_mlruns
+        elif os.path.exists(backend_mlruns):
+            mlruns_path = backend_mlruns
+        else:
+            return {"status": "FAILED", "error": "mlruns 폴더를 찾을 수 없습니다."}
+
+        # Windows 경로를 file URI로 변환
+        tracking_uri = f"file:///{mlruns_path.replace(os.sep, '/')}"
+        mlflow.set_tracking_uri(tracking_uri)
+
+        client = MlflowClient()
+
+        # 추천 모델 (아티팩트 기반) 특별 처리
+        if "recommendation" in req.model_name.lower():
+            # 추천 모델은 이미 backend에 model_reco.pkl로 저장되어 있음
+            reco_path = os.path.join(st.BASE_DIR, "model_reco.pkl")
+            if os.path.exists(reco_path):
+                model = joblib.load(reco_path)
+                st.sar_model = model
+                st.logger.info(f"MLFLOW_MODEL_LOADED name={req.model_name} version={req.version} target=sar_model")
+                return {
+                    "status": "SUCCESS",
+                    "message": f"{req.model_name} v{req.version} 모델이 로드되었습니다.",
+                    "model_name": req.model_name,
+                    "version": req.version,
+                }
+            else:
+                return {"status": "FAILED", "error": "추천 모델 파일(model_reco.pkl)을 찾을 수 없습니다."}
+
+        # Model Registry에서 해당 버전의 run_id 찾기
+        try:
+            model_version = client.get_model_version(req.model_name, req.version)
+            run_id = model_version.run_id
+            artifact_path = model_version.source
+        except Exception as e:
+            st.logger.warning(f"Model version lookup failed: {e}, trying artifact path")
+            # 직접 아티팩트 경로에서 로드 시도
+            artifact_path = None
+            run_id = None
+
+        # 모델 로드 시도
+        model = None
+        load_errors = []
+
+        # 방법 1: Model Registry URI
+        if model is None:
+            try:
+                model_uri = f"models:/{req.model_name}/{req.version}"
+                model = mlflow.sklearn.load_model(model_uri)
+            except Exception as e:
+                load_errors.append(f"Registry URI: {e}")
+
+        # 방법 2: artifact_path에서 직접 로드
+        if model is None and artifact_path:
+            try:
+                model = mlflow.sklearn.load_model(artifact_path)
+            except Exception as e:
+                load_errors.append(f"Artifact path: {e}")
+
+        # 방법 3: run_id로 아티팩트 경로 구성
+        if model is None and run_id:
+            try:
+                # 모델명에서 artifact_path 추론
+                model_artifact = req.model_name.replace("fintech-", "").replace("-model", "_model")
+                runs_uri = f"runs:/{run_id}/{model_artifact}"
+                model = mlflow.sklearn.load_model(runs_uri)
+            except Exception as e:
+                load_errors.append(f"Runs URI: {e}")
+
+        if model is None:
+            return {"status": "FAILED", "error": f"모델 로드 실패: {'; '.join(load_errors)}"}
+
+        # 모델 이름에 따라 적절한 전역 변수에 할당
+        if "revenue" in req.model_name.lower():
+            st.rf_reg = model
+            st.logger.info(f"MLFLOW_MODEL_LOADED name={req.model_name} version={req.version} target=rf_reg")
+        elif "anomaly" in req.model_name.lower():
+            st.iso_forest = model
+            st.logger.info(f"MLFLOW_MODEL_LOADED name={req.model_name} version={req.version} target=iso_forest")
+        elif "growth" in req.model_name.lower():
+            st.rf_clf = model
+            st.logger.info(f"MLFLOW_MODEL_LOADED name={req.model_name} version={req.version} target=rf_clf")
+        else:
+            return {"status": "FAILED", "error": f"지원하지 않는 모델입니다: {req.model_name}"}
+
+        return {
+            "status": "SUCCESS",
+            "message": f"{req.model_name} v{req.version} 모델이 로드되었습니다.",
+            "model_name": req.model_name,
+            "version": req.version,
+        }
+    except ImportError:
+        return {"status": "FAILED", "error": "MLflow가 설치되지 않았습니다."}
+    except Exception as e:
+        st.logger.exception("MLflow 모델 로드 실패")
+        return {"status": "FAILED", "error": safe_str(e)}
+
+
+@router.get("/users")
+def get_users(user: dict = Depends(verify_credentials)):
+    if user["role"] != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+    return {"status": "SUCCESS", "data": [{"아이디": k, "이름": v["name"], "권한": v["role"]} for k, v in st.USERS.items()]}
+
+
+@router.get("/settings/default")
+def get_default_settings(user: dict = Depends(verify_credentials)):
+    return {
+        "status": "SUCCESS",
+        "data": {
+            "selectedModel": "gpt-4o",
+            "maxTokens": 4000,
+            "temperature": 0.7,
+            "topP": 1.0,
+            "presencePenalty": 0.0,
+            "frequencyPenalty": 0.0,
+            "seed": "",
+            "timeoutMs": 30000,
+            "retries": 2,
+            "stream": True,
+            "systemPrompt": DEFAULT_SYSTEM_PROMPT,
+        },
+    }
+
+
+@router.post("/users")
+def create_user(req: UserCreateRequest, user: dict = Depends(verify_credentials)):
+    if user["role"] != "관리자":
+        raise HTTPException(status_code=403, detail="권한 없음")
+    if req.user_id in st.USERS:
+        raise HTTPException(status_code=400, detail="이미 존재하는 아이디")
+    st.USERS[req.user_id] = {"password": req.password, "role": req.role, "name": req.name}
+    return {"status": "SUCCESS", "message": f"{req.name} 추가됨"}
+
+
+@router.get("/export/csv")
+def export_csv(user: dict = Depends(verify_credentials)):
+    output = StringIO()
+    export_df = st.metrics_clean.copy() if st.metrics_clean is not None else pd.DataFrame()
+    cols_to_convert = ["txn_month", "industry", "region", "growth_type", "merchant_name", "merchant_id"]
+    for col in cols_to_convert:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].astype(str)
+    export_df.to_csv(output, index=False, encoding="utf-8-sig")
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=data_{datetime.now().strftime('%Y%m%d')}.csv"},
+    )
+
+
+@router.get("/export/excel")
+def export_excel(user: dict = Depends(verify_credentials)):
+    output = BytesIO()
+    export_df = st.metrics_clean.copy() if st.metrics_clean is not None else pd.DataFrame()
+    cols_to_convert = ["txn_month", "industry", "region", "growth_type", "merchant_name", "merchant_id"]
+    for col in cols_to_convert:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].astype(str)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=data_{datetime.now().strftime('%Y%m%d')}.xlsx"},
+    )
+
+
+@router.post("/explain/revenue")
+def explain_revenue(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_explain_revenue_prediction(req.merchant_id, top_k=5)
+
+
+@router.post("/explain/growth")
+def explain_growth(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_explain_growth_classification(req.merchant_id, top_k=5)
+
+
+@router.post("/explain/anomaly")
+def explain_anomaly(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_explain_anomaly_detection(req.merchant_id, top_k=5)
+
+
+@router.post("/metrics/history/summary")
+def metrics_history_summary(req: MerchantRequest, user: dict = Depends(verify_credentials)):
+    return tool_get_merchant_metrics_history_summary(req.merchant_id, months=6)
+
+
+@router.get("/dashboard/{merchant_id}")
+def dashboard_merchant(merchant_id: str, user: dict = Depends(verify_credentials)):
+    return tool_get_merchant_metrics_history_summary(merchant_id, months=12)
+
+
+@router.get("/metrics")
+def metrics_query(merchant_id: str, user: dict = Depends(verify_credentials)):
+    return tool_get_merchant_metrics_history_summary(merchant_id, months=12)

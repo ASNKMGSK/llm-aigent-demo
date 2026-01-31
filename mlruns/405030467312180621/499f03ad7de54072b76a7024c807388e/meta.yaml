@@ -1,0 +1,14 @@
+artifact_uri: file:///C:/Users/AKS/Desktop/project/mlruns/405030467312180621/499f03ad7de54072b76a7024c807388e/artifacts
+end_time: 1769681744987
+entry_point_name: ''
+experiment_id: '405030467312180621'
+lifecycle_stage: active
+run_id: 499f03ad7de54072b76a7024c807388e
+run_name: recommendation_model
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1769681743421
+status: 3
+tags: []
+user_id: AKS

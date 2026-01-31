@@ -1,0 +1,15 @@
+creation_timestamp: 1769681755803
+current_stage: None
+deployment_job_state: null
+description: null
+last_updated_timestamp: 1769681755803
+model_id: m-aa09a7f99fb54f218a59a2afd2016226
+name: fintech-growth-model
+run_id: 32ec3cb536584c53af681ed307dda2b5
+run_link: null
+source: models:/m-aa09a7f99fb54f218a59a2afd2016226
+status: READY
+status_message: null
+storage_location: file:///C:/Users/AKS/Desktop/project/mlruns/405030467312180621/models/m-aa09a7f99fb54f218a59a2afd2016226/artifacts
+user_id: null
+version: 1

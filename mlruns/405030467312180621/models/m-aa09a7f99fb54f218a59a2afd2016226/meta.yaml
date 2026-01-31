@@ -1,0 +1,10 @@
+artifact_location: file:///C:/Users/AKS/Desktop/project/mlruns/405030467312180621/models/m-aa09a7f99fb54f218a59a2afd2016226/artifacts
+creation_timestamp: 1769681745739
+experiment_id: '405030467312180621'
+last_updated_timestamp: 1769681755770
+model_id: m-aa09a7f99fb54f218a59a2afd2016226
+model_type: null
+name: growth_model
+source_run_id: 32ec3cb536584c53af681ed307dda2b5
+status: 2
+status_message: null

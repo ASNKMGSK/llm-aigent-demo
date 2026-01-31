@@ -1,0 +1,62 @@
+import { progressStart, progressDone } from '@/lib/progress';
+
+export function getApiBase() {
+  return process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
+}
+
+export function makeBasicAuthHeader(username, password) {
+  if (typeof window === 'undefined') return '';
+  const token = window.btoa(`${username}:${password}`);
+  return `Basic ${token}`;
+}
+
+export async function apiCall({
+  endpoint,
+  method = 'GET',
+  data = null,
+  auth = null,
+  timeoutMs = 60000,
+  headers = {},
+  responseType = 'json',
+}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  const url = `${getApiBase()}${endpoint}`;
+  const init = {
+    method,
+    signal: controller.signal,
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+  };
+
+  if (auth?.username && auth?.password) {
+    init.headers['Authorization'] = makeBasicAuthHeader(auth.username, auth.password);
+  }
+
+  if (method !== 'GET' && data !== null) {
+    init.body = JSON.stringify(data);
+  }
+
+  try {
+    if (typeof window !== 'undefined') progressStart();
+
+    const resp = await fetch(url, init);
+    clearTimeout(t);
+
+    if (responseType === 'blob') {
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return await resp.blob();
+    }
+
+    const json = await resp.json().catch(() => ({}));
+    return json;
+  } catch (e) {
+    clearTimeout(t);
+    return { status: 'FAILED', error: String(e?.message || e) };
+  } finally {
+    if (typeof window !== 'undefined') progressDone();
+  }
+}

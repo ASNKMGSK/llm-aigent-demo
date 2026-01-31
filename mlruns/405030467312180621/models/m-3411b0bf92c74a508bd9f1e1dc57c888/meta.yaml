@@ -1,0 +1,10 @@
+artifact_location: file:///C:/Users/AKS/Desktop/project/mlruns/405030467312180621/models/m-3411b0bf92c74a508bd9f1e1dc57c888/artifacts
+creation_timestamp: 1769681713045
+experiment_id: '405030467312180621'
+last_updated_timestamp: 1769681732696
+model_id: m-3411b0bf92c74a508bd9f1e1dc57c888
+model_type: null
+name: revenue_model
+source_run_id: f8851fd05f6f409e95bbcd304824826b
+status: 2
+status_message: null

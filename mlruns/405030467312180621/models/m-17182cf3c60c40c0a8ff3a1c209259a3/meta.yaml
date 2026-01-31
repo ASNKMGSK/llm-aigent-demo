@@ -1,0 +1,10 @@
+artifact_location: file:///C:/Users/AKS/Desktop/project/mlruns/405030467312180621/models/m-17182cf3c60c40c0a8ff3a1c209259a3/artifacts
+creation_timestamp: 1769681733732
+experiment_id: '405030467312180621'
+last_updated_timestamp: 1769681743082
+model_id: m-17182cf3c60c40c0a8ff3a1c209259a3
+model_type: null
+name: anomaly_model
+source_run_id: 1ad314b7497c43bbb3160629192604f4
+status: 2
+status_message: null
